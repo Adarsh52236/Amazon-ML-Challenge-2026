@@ -1,0 +1,271 @@
+"""Candidate generation module for Business Entity Resolution.
+
+Constructs inverted index tables across secondary sources (Source 2 & Source 3),
+retrieves candidate pairs for Source 1 reference entities across multiple channels,
+strictly enforces source restrictions, and tracks channel provenance.
+"""
+
+from __future__ import annotations
+
+import csv
+import logging
+from collections import defaultdict
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import (
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
+
+import pandas as pd
+
+from business_entity_resolution.address_normalizer import (
+    BusinessAddressNormalizer,
+    NormalizedBusinessAddress,
+)
+from business_entity_resolution.blocking_keys import generate_blocking_keys
+from business_entity_resolution.preprocessing_config import BlockingConfig
+from business_entity_resolution.text_normalizer import (
+    BusinessNameNormalizer,
+    NormalizedBusinessName,
+)
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CandidatePair:
+    """Internal representation of a candidate pair between Source 1 and a secondary source."""
+
+    source1_entity_id: str
+    matched_entity_id: str
+    matched_source: str  # 'S2' or 'S3'
+    channels: List[str] = field(default_factory=list)
+
+
+class CandidateGenerator:
+    """Multi-channel inverted-index candidate generator for business entity resolution."""
+
+    def __init__(
+        self,
+        config: Optional[BlockingConfig] = None,
+        name_normalizer: Optional[BusinessNameNormalizer] = None,
+        addr_normalizer: Optional[BusinessAddressNormalizer] = None,
+    ):
+        self.config = config or BlockingConfig()
+        self.name_normalizer = name_normalizer or BusinessNameNormalizer()
+        self.addr_normalizer = addr_normalizer or BusinessAddressNormalizer()
+
+        # Inverted index: channel -> key -> list of target entity IDs
+        self.index: Dict[str, Dict[str, List[str]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        self.indexed_target_count = 0
+
+    def index_target_record(
+        self,
+        entity_id: str,
+        name: str,
+        address: str,
+        country: str,
+    ) -> None:
+        """Index a single target record (from Source 2 or Source 3)."""
+        # Enforce source restrictions: target MUST be S2 or S3
+        if entity_id.startswith("S1-"):
+            raise ValueError(
+                f"Source 1 record '{entity_id}' cannot be indexed as a target match candidate!"
+            )
+
+        norm_name = self.name_normalizer.normalize(name)
+        norm_addr = self.addr_normalizer.normalize(address, country)
+        b_keys = generate_blocking_keys(
+            norm_name, norm_addr, country, self.config
+        )
+
+        for channel, keys in b_keys.items():
+            for key in keys:
+                self.index[channel][key].append(entity_id)
+
+        self.indexed_target_count += 1
+
+    def build_index_from_dataframe(self, df: pd.DataFrame) -> None:
+        """Build target index from a DataFrame of Source 2 / Source 3 records."""
+        for _, row in df.iterrows():
+            self.index_target_record(
+                entity_id=str(row["entity_id"]),
+                name=str(row.get("business_name", "")),
+                address=str(row.get("business_address", "")),
+                country=str(row.get("country", "")),
+            )
+
+    def build_index_from_records(
+        self, records: Iterable[Dict[str, str]]
+    ) -> None:
+        """Streamingly build target index from an iterator of record dictionaries."""
+        for r in records:
+            self.index_target_record(
+                entity_id=str(r["entity_id"]),
+                name=str(r.get("business_name", "")),
+                address=str(r.get("business_address", "")),
+                country=str(r.get("country", "")),
+            )
+
+    def prune_high_frequency_keys(self) -> Dict[str, int]:
+        """Prune inverted index keys that exceed max_key_frequency to avoid explosive Cartesian products."""
+        pruned_stats: Dict[str, int] = {}
+        max_freq = self.config.max_key_frequency
+
+        for channel, key_map in self.index.items():
+            pruned_count = 0
+            keys_to_remove = [k for k, ids in key_map.items() if len(ids) > max_freq]
+            for k in keys_to_remove:
+                del key_map[k]
+                pruned_count += 1
+            pruned_stats[channel] = pruned_count
+
+        return pruned_stats
+
+    def generate_candidates_for_record(
+        self,
+        s1_id: str,
+        name: str,
+        address: str,
+        country: str,
+    ) -> List[CandidatePair]:
+        """Retrieve candidate matches for a single Source 1 record across all active channels."""
+        if not s1_id.startswith("S1-"):
+            raise ValueError(
+                f"Reference entity must be from Source 1 ('S1-'), got '{s1_id}'"
+            )
+
+        norm_name = self.name_normalizer.normalize(name)
+        norm_addr = self.addr_normalizer.normalize(address, country)
+        b_keys = generate_blocking_keys(
+            norm_name, norm_addr, country, self.config
+        )
+
+        # Map candidate_id -> list of unique channels
+        matched_candidates: Dict[str, List[str]] = defaultdict(list)
+
+        for channel, keys in b_keys.items():
+            channel_index = self.index.get(channel)
+            if not channel_index:
+                continue
+            
+            # Fast C-level union of target IDs for this channel
+            ch_targets = set()
+            for key in keys:
+                target_ids = channel_index.get(key)
+                if target_ids:
+                    ch_targets.update(target_ids)
+            
+            # Since ch_targets is unique, append is safe and faster than set.add
+            for tid in ch_targets:
+                matched_candidates[tid].append(channel)
+
+        # Enforce max candidates cap per entity if configured
+        candidate_items = list(matched_candidates.items())
+        if (
+            self.config.max_candidates_per_entity
+            and len(candidate_items) > self.config.max_candidates_per_entity
+        ):
+            # Prioritize candidates by cumulative channel weight, then channel count
+            if isinstance(self.config, dict):
+                weights = self.config.get("channel_weights", {}) or {}
+            else:
+                weights = getattr(self.config, "channel_weights", {}) or {}
+
+            def candidate_priority_score(item: Tuple[str, Set[str]]) -> Tuple[int, int]:
+                total_weight = sum(weights.get(ch, 1) for ch in item[1])
+                return (total_weight, len(item[1]))
+
+            candidate_items.sort(key=candidate_priority_score, reverse=True)
+            candidate_items = candidate_items[
+                : self.config.max_candidates_per_entity
+            ]
+
+        results: List[CandidatePair] = []
+        for tid, channels in candidate_items:
+            m_source = "S2" if tid.startswith("S2-") else "S3"
+            results.append(
+                CandidatePair(
+                    source1_entity_id=s1_id,
+                    matched_entity_id=tid,
+                    matched_source=m_source,
+                    channels=sorted(channels),
+                )
+            )
+
+        return results
+
+    def generate_candidates_for_dataframe(
+        self, s1_df: pd.DataFrame
+    ) -> List[CandidatePair]:
+        """Generate candidates for a batch of Source 1 records."""
+        all_candidates: List[CandidatePair] = []
+        for _, row in s1_df.iterrows():
+            candidates = self.generate_candidates_for_record(
+                s1_id=str(row["entity_id"]),
+                name=str(row.get("business_name", "")),
+                address=str(row.get("business_address", "")),
+                country=str(row.get("country", "")),
+            )
+            all_candidates.extend(candidates)
+        return all_candidates
+
+    @staticmethod
+    def candidates_to_dataframe(
+        candidates: Sequence[CandidatePair],
+    ) -> pd.DataFrame:
+        """Convert list of CandidatePairs to a pandas DataFrame."""
+        return pd.DataFrame(
+            [
+                {
+                    "source1_entity_id": c.source1_entity_id,
+                    "matched_entity_id": c.matched_entity_id,
+                    "matched_source": c.matched_source,
+                    "channels": ",".join(c.channels),
+                }
+                for c in candidates
+            ]
+        )
+
+    @staticmethod
+    def export_to_official_candidate_pairs(
+        candidates: Sequence[CandidatePair],
+        s1_entity_ids: Sequence[str],
+        output_path: Union[Path, str],
+    ) -> Path:
+        """Export candidates into the official competition 'candidate_pairs.tsv' format.
+
+        Format:
+        source1_entity_id\tcandidate_entity_ids
+        - Every Source 1 entity in s1_entity_ids must appear exactly once.
+        - Empty string if no candidates found.
+        - Comma-separated unique IDs, no spaces.
+        """
+        out_p = Path(output_path).resolve()
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+
+        # Group candidates by S1 ID
+        s1_to_candidates: Dict[str, List[str]] = defaultdict(list)
+        for c in candidates:
+            s1_to_candidates[c.source1_entity_id].append(c.matched_entity_id)
+
+        with open(out_p, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow(["source1_entity_id", "candidate_entity_ids"])
+            for s1_id in s1_entity_ids:
+                cand_list = s1_to_candidates.get(s1_id, [])
+                # Deduplicate while preserving order
+                unique_cands = list(dict.fromkeys(cand_list))
+                writer.writerow([s1_id, ",".join(unique_cands)])
+
+        return out_p
